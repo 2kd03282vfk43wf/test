@@ -1,0 +1,792 @@
+// ==UserScript==
+// @name         ash8
+// @namespace    http://tampermonkey.net/
+// @version      8.0.0
+// @description  webclip
+// @author
+// @match        *://*/*
+// @grant        GM_getValue
+// @grant        GM_setValue
+// @grant        GM_addStyle
+// ==/UserScript==
+
+(function() {
+    'use strict';
+
+    const logMessage = (message) => console.log(`${new Date().toLocaleTimeString()} - ${message}`);
+
+    const StateManager = {
+        window: null, customTabs: new Set(GM_getValue('customTabs', ['メモ'])), tabColors: new Map(Object.entries(GM_getValue('tabColors', {}))), tabThumbnails: new Map(Object.entries(GM_getValue('tabThumbnails', {}))),
+        selectionMode: false, videoThumbnailMode: false, tagExtractionMode: false, compressionRate: 0.2, currentCompressedImage: null,
+        isDraggingToolbar: false, offsetXToolbar: 0, offsetYToolbar: 0, zIndexCounter: 10000, activeMenu: null, activePopup: null, isHoverEnabled: false,
+        setWindow(windowObj) { this.window = windowObj; GM_setValue('savedWindow', windowObj ? windowObj.id : null); },
+        updateCustomTabs(tabs) { this.customTabs = new Set(tabs); GM_setValue('customTabs', [...this.customTabs]); },
+        setTabColor(tab, color) { this.tabColors.set(tab, color); GM_setValue('tabColors', Object.fromEntries(this.tabColors)); },
+        setTabThumbnail(tab, thumbnail) { this.tabThumbnails.set(tab, thumbnail); GM_setValue('tabThumbnails', Object.fromEntries(this.tabThumbnails)); }
+    };
+
+    const state = new Proxy(StateManager, {
+        set(target, prop, value) {
+            Reflect.set(target, prop, value);
+            if (prop === 'currentCompressedImage' && value) {
+                const img = document.getElementById('compressedImage');
+                if (img) img.src = value;
+                if (document.getElementById('autoSaveCheckbox')?.checked) saveImage();
+            }
+            if (prop === 'window' && value) updateTabs(value);
+            return true;
+        }
+    });
+
+    const EventManager = {
+        handlers: new WeakMap(),
+        add(element, type, handler, options = {}) { if (!element) return; element.addEventListener(type, handler, options); const handlers = this.handlers.get(element) || []; handlers.push({ type, handler, options }); this.handlers.set(element, handlers); },
+        removeAll(element) { const handlers = this.handlers.get(element) || []; handlers.forEach(({ type, handler, options }) => element.removeEventListener(type, handler, options)); this.handlers.delete(element); }
+    };
+    const events = EventManager;
+
+    const Toolbar = {
+        elements: null,
+        init() {
+            try {
+                const toolbar = document.createElement('div');
+                toolbar.id = 'toolbar';
+                const fragment = document.createDocumentFragment();
+
+                const handle = document.createElement('div'); handle.id = 'toolbarHandle';
+                const selectImgBtn = document.createElement('button'); selectImgBtn.id = 'selectImageButton'; selectImgBtn.textContent = '📸';
+                const selectVidBtn = document.createElement('button'); selectVidBtn.id = 'selectVideoThumbnailButton'; selectVidBtn.textContent = '📹';
+                const extractTagsBtn = document.createElement('button'); extractTagsBtn.id = 'extractTagsButton'; extractTagsBtn.textContent = '📌';
+                const pasteArea = document.createElement('textarea'); pasteArea.id = 'pasteImageArea'; pasteArea.placeholder = 'copy';
+                const compressionDiv = document.createElement('div'); compressionDiv.id = 'compressionButtons';
+                const comp30 = document.createElement('button'); comp30.id = 'compression30'; comp30.textContent = '30';
+                const comp50 = document.createElement('button'); comp50.id = 'compression50'; comp50.textContent = '50';
+                const comp70 = document.createElement('button'); comp70.id = 'compression70'; comp70.textContent = '70';
+                compressionDiv.append(comp30, comp50, comp70);
+                const saveBtn = document.createElement('button'); saveBtn.id = 'saveButton'; saveBtn.textContent = '💾';
+                const autoSave = document.createElement('input'); autoSave.type = 'checkbox'; autoSave.id = 'autoSaveCheckbox'; autoSave.checked = true; autoSave.title = '自動保存';
+                const toggleWinBtn = document.createElement('button'); toggleWinBtn.id = 'toggleWindowButton'; toggleWinBtn.textContent = '🖼️';
+                const logBtn = document.createElement('button'); logBtn.id = 'logButton'; logBtn.textContent = 'log';
+                const exportBtn = document.createElement('button'); exportBtn.id = 'exportButton'; exportBtn.textContent = '📤';
+                const importBtn = document.createElement('button'); importBtn.id = 'importButton'; importBtn.textContent = '📥';
+                const compRate = document.createElement('div'); compRate.id = 'compressionRate';
+                const debugOut = document.createElement('div'); debugOut.id = 'debugOutput';
+
+                fragment.append(handle, selectImgBtn, selectVidBtn, extractTagsBtn, pasteArea, compressionDiv, saveBtn, autoSave, toggleWinBtn, logBtn, exportBtn, importBtn, compRate, debugOut);
+                toolbar.appendChild(fragment);
+                document.body.appendChild(toolbar);
+
+                this.elements = {
+                    toolbar,
+                    selectImageButton: toolbar.querySelector('#selectImageButton'),
+                    selectVideoThumbnailButton: toolbar.querySelector('#selectVideoThumbnailButton'),
+                    extractTagsButton: toolbar.querySelector('#extractTagsButton'),
+                    pasteImageArea: toolbar.querySelector('#pasteImageArea'),
+                    compressionRateDisplay: toolbar.querySelector('#compressionRate'),
+                    debugOutput: toolbar.querySelector('#debugOutput'),
+                    saveButton: toolbar.querySelector('#saveButton'),
+                    autoSaveCheckbox: toolbar.querySelector('#autoSaveCheckbox'),
+                    toggleWindowButton: toolbar.querySelector('#toggleWindowButton'),
+                    logButton: toolbar.querySelector('#logButton'),
+                    exportButton: toolbar.querySelector('#exportButton'),
+                    importButton: toolbar.querySelector('#importButton'),
+                    toolbarHandle: toolbar.querySelector('#toolbarHandle'),
+                    compression30: toolbar.querySelector('#compression30'),
+                    compression50: toolbar.querySelector('#compression50'),
+                    compression70: toolbar.querySelector('#compression70')
+                };
+
+                logMessage("ツールバー追加成功");
+                this.setupEventListeners();
+                return this.elements;
+            } catch (e) {
+                logMessage(`ツールバー初期化失敗: ${e.message}`);
+                return null;
+            }
+        },
+        setupEventListeners() {
+            events.add(window, 'load', () => this.elements.autoSaveCheckbox.checked = true);
+            events.add(this.elements.selectImageButton, 'click', () => this.startImageSelectionMode());
+            events.add(this.elements.selectVideoThumbnailButton, 'click', () => this.startVideoThumbnailMode());
+            events.add(this.elements.extractTagsButton, 'click', () => this.startTagExtractionMode());
+            events.add(this.elements.pasteImageArea, 'contextmenu', (e) => this.pasteImageFromClipboard(e));
+            events.add(this.elements.saveButton, 'click', () => saveImage());
+            events.add(this.elements.toggleWindowButton, 'click', () => this.toggleWindow());
+            events.add(this.elements.logButton, 'click', () => createLogWindow());
+            events.add(this.elements.exportButton, 'click', () => this.exportItems());
+            events.add(this.elements.importButton, 'click', () => this.importItems());
+            events.add(this.elements.compression30, 'click', () => this.setCompressionRate(0.3));
+            events.add(this.elements.compression50, 'click', () => this.setCompressionRate(0.5));
+            events.add(this.elements.compression70, 'click', () => this.setCompressionRate(0.7));
+            this.setupDrag();
+            logMessage("ツールバーリスナー設定完了");
+        },
+        startImageSelectionMode() {
+            if (state.videoThumbnailMode) { state.videoThumbnailMode = false; this.elements.selectVideoThumbnailButton.textContent = "📹"; this.elements.selectVideoThumbnailButton.classList.remove("active"); events.removeAll(document); }
+            state.selectionMode = true; this.elements.selectImageButton.textContent = "ON"; this.elements.selectImageButton.classList.add("active"); events.add(document, 'click', (e) => this.handleImageClick(e), { capture: true });
+            logMessage("画像選択モード開始");
+        },
+        handleImageClick(event) {
+            if (!state.selectionMode || event.target.tagName.toLowerCase() !== 'img') return;
+            event.preventDefault(); event.stopPropagation(); state.selectionMode = false; this.elements.selectImageButton.textContent = "📸"; this.elements.selectImageButton.classList.remove("active"); events.removeAll(document);
+            const src = new URL(event.target.src, location.href).href; logMessage(`画像選択: ${src}`); this.processImage(src);
+        },
+        startVideoThumbnailMode() {
+            if (state.selectionMode) { state.selectionMode = false; this.elements.selectImageButton.textContent = "📸"; this.elements.selectImageButton.classList.remove("active"); events.removeAll(document); }
+            state.videoThumbnailMode = true; this.elements.selectVideoThumbnailButton.textContent = "動画をクリック"; this.elements.selectVideoThumbnailButton.classList.add("active"); events.add(document, 'click', (e) => this.handleVideoThumbnailClick(e), { capture: true });
+        },
+        handleVideoThumbnailClick(event) {
+            if (!state.videoThumbnailMode || event.target.tagName.toLowerCase() !== 'video') return;
+            event.preventDefault(); event.stopPropagation(); state.videoThumbnailMode = false; this.elements.selectVideoThumbnailButton.textContent = "📹"; this.elements.selectVideoThumbnailButton.classList.remove("active"); events.removeAll(document);
+            const video = event.target; logMessage(`動画選択: ${video.src}`); const canvas = document.createElement('canvas'); canvas.width = video.videoWidth; canvas.height = video.videoHeight; const ctx = canvas.getContext('2d'); ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+            const thumbnailDataURL = canvas.toDataURL('image/jpeg'); logMessage(`サムネイルキャプチャ完了: ${canvas.width}x${canvas.height}`); this.processImage(thumbnailDataURL);
+        },
+        startTagExtractionMode() {
+            state.tagExtractionMode = true; this.elements.extractTagsButton.textContent = "タグ抽出中"; this.elements.extractTagsButton.classList.add("active");
+            const { tags, extractedDate } = extractTagsAndDate();
+            if (tags.length || extractedDate) {
+                const domain = window.location.hostname; const savedData = { image: state.currentCompressedImage || '', url: window.location.href, title: document.title, favicon: getFaviconForNewTab(domain, window.location.href), timestamp: new Date().toISOString(), tab: domain, tags, extractedDate };
+                const allItems = GM_getValue('savedItems', []); allItems.push(savedData); GM_setValue('savedItems', allItems);
+                if (state.window) { state.window.activeTab = domain; updateTabs(state.window); }
+                logMessage('タグと日付保存成功');
+            }
+            state.tagExtractionMode = false; this.elements.extractTagsButton.textContent = "📌"; this.elements.extractTagsButton.classList.remove("active");
+        },
+        setCompressionRate(rate) { state.compressionRate = rate; document.querySelectorAll('#compressionButtons button').forEach(b => b.classList.remove('selected')); document.getElementById(`compression${rate * 100}`).classList.add('selected'); this.startImageSelectionMode(); },
+        pasteImageFromClipboard(event) {
+            event.preventDefault(); logMessage('クリップボードから画像貼り付け開始');
+            navigator.clipboard.read().then(data => {
+                if (!data.some(item => item.types.some(type => type.startsWith('image/')))) { logMessage('クリップボードに画像なし'); return; }
+                for (const item of data) {
+                    for (const type of item.types) {
+                        if (type.startsWith('image/')) {
+                            item.getType(type).then(blob => {
+                                const reader = new FileReader(); reader.onload = (e) => this.processImage(e.target.result); reader.readAsDataURL(blob);
+                            }).catch(err => logMessage(`クリップボード画像取得失敗: ${err.message}`));
+                            break;
+                        }
+                    }
+                }
+            }).catch(err => logMessage(`クリップボード読み込み失敗: ${err.message}`));
+        },
+        processImage(src) {
+            const img = new Image(); img.crossOrigin = "Anonymous"; img.src = src;
+            img.onload = () => {
+                try {
+                    const canvas = document.createElement('canvas'); canvas.width = Math.floor(img.width * state.compressionRate); canvas.height = Math.floor(img.height * state.compressionRate); const ctx = canvas.getContext('2d'); ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+                    const compressedDataURL = canvas.toDataURL('image/jpeg', state.compressionRate); state.currentCompressedImage = compressedDataURL; const originalDataURL = canvas.toDataURL('image/jpeg', 1.0); const rate = ((1 - compressedDataURL.length / originalDataURL.length) * 100).toFixed(2);
+                    this.elements.compressionRateDisplay.textContent = `圧縮率: ${rate}%`; logMessage(`画像圧縮成功: ${rate}%`);
+                } catch (e) { logMessage(`画像圧縮失敗: ${e.message}`); this.elements.compressionRateDisplay.textContent = "圧縮失敗"; }
+            };
+            img.onerror = () => { logMessage(`画像読み込み失敗: ${src} (CORSの可能性)`); this.elements.compressionRateDisplay.textContent = "画像読み込み失敗"; };
+        },
+        exportItems() {
+            try {
+                const allItems = GM_getValue('savedItems', []);
+                const customTabs = [...state.customTabs];
+                const tabColors = Object.fromEntries(state.tabColors);
+                const tabThumbnails = Object.fromEntries(state.tabThumbnails);
+                const exportData = { items: allItems, customTabs, tabColors, tabThumbnails };
+                const jsonStr = JSON.stringify(exportData, null, 2);
+                const blob = new Blob([jsonStr], { type: 'application/json' });
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = `saved_items_${new Date().toISOString().split('T')[0]}.json`;
+                document.body.appendChild(a);
+                a.click();
+                document.body.removeChild(a);
+                URL.revokeObjectURL(url);
+                logMessage('アイテムのエクスポート成功');
+                alert('エクスポートが完了しました。');
+            } catch (e) {
+                logMessage(`エクスポート失敗: ${e.message}`);
+                alert('エクスポートに失敗しました。');
+            }
+        },
+        importItems() {
+            const input = document.createElement('input');
+            input.type = 'file';
+            input.accept = 'application/json';
+            input.onchange = (e) => {
+                const file = e.target.files[0];
+                if (!file) return;
+                const reader = new FileReader();
+                reader.onload = (ev) => {
+                    try {
+                        const data = JSON.parse(ev.target.result);
+                        if (!data.items || !Array.isArray(data.items)) throw new Error('無効なJSON形式');
+                        const confirmMerge = confirm('既存のデータを保持してマージしますか？（いいえを選択すると上書きされます）');
+                        let allItems = confirmMerge ? GM_getValue('savedItems', []) : [];
+                        allItems = [...allItems, ...data.items];
+                        GM_setValue('savedItems', allItems);
+                        if (data.customTabs && Array.isArray(data.customTabs)) {
+                            state.updateCustomTabs([...new Set([...state.customTabs, ...data.customTabs])]);
+                        }
+                        if (data.tabColors && typeof data.tabColors === 'object') {
+                            Object.entries(data.tabColors).forEach(([tab, color]) => state.setTabColor(tab, color));
+                        }
+                        if (data.tabThumbnails && typeof data.tabThumbnails === 'object') {
+                            Object.entries(data.tabThumbnails).forEach(([tab, thumbnail]) => state.setTabThumbnail(tab, thumbnail));
+                        }
+                        if (state.window) {
+                            updateTabs(state.window);
+                            displaySavedItems(state.window);
+                        }
+                        logMessage('アイテムのインポート成功');
+                        alert('インポートが完了しました。');
+                    } catch (err) {
+                        logMessage(`インポート失敗: ${err.message}`);
+                        alert('インポートの処理に失敗しました。ファイルを確認してください。');
+                    }
+                };
+                reader.readAsText(file);
+            };
+            input.click();
+        },
+        setupDrag() {
+            const handleMove = (e) => {
+                if (state.isDraggingToolbar) {
+                    let leftPx = e.clientX - state.offsetXToolbar; let topPx = e.clientY - state.offsetYToolbar; leftPx = Math.max(0, Math.min(leftPx, window.innerWidth - this.elements.toolbar.offsetWidth)); topPx = Math.max(0, Math.min(topPx, window.innerHeight - this.elements.toolbar.offsetHeight));
+                    requestAnimationFrame(() => { this.elements.toolbar.style.left = `${leftPx}px`; this.elements.toolbar.style.top = `${topPx}px`; });
+                }
+            };
+            const handleUp = () => { if (state.isDraggingToolbar) { GM_setValue('toolbarPosition', { left: this.elements.toolbar.style.left, top: this.elements.toolbar.style.top }); state.isDraggingToolbar = false; document.removeEventListener('mousemove', handleMove); document.removeEventListener('mouseup', handleUp); } };
+            events.add(this.elements.toolbarHandle, 'mousedown', (e) => { state.isDraggingToolbar = true; state.offsetXToolbar = e.clientX - this.elements.toolbar.offsetLeft; state.offsetYToolbar = e.clientY - this.elements.toolbar.offsetTop; e.preventDefault(); document.addEventListener('mousemove', handleMove); document.addEventListener('mouseup', handleUp); });
+        },
+        toggleWindow() {
+            if (!state.window) {
+                const id = 'single-window';
+                const savedState = GM_getValue(`windowState-${id}`, { position: { left: '21px', top: '23px' }, size: { width: '950px', height: '550px' } });
+                const windowObj = Window.create(id, savedState);
+                if (windowObj) { state.setWindow(windowObj); windowObj.el.style.display = 'none'; }
+            }
+            const windowEl = state.window.el;
+            windowEl.style.display = windowEl.style.display === 'none' ? 'block' : 'none';
+            if (windowEl.style.display === 'block') bringToFront(state.window);
+            Window.saveState(state.window);
+            this.elements.toggleWindowButton.textContent = windowEl.style.display === 'block' ? '🔽' : '🖼️';
+        }
+    };
+
+    const Window = {
+        colorPresets: new Map([['赤', '#8B0000'], ['青', '#1E90FF'], ['黄色', '#DAA520'], ['緑', '#228B22'], ['ピンク', '#C71585'], ['オレンジ', '#FF4500'], ['紫', '#4B0082'], ['茶色', '#8B4513'], ['灰色', '#696969']]),
+        thumbnailPresets: ['🌟', '📌', '📷', '📖', '🎵'],
+        create(id, savedState) {
+            try {
+                const el = document.createElement('div');
+                el.className = 'window';
+                el.id = `window-${id}`;
+                const fragment = document.createDocumentFragment();
+
+                const windowObj = {
+                    el, id, name: savedState?.name || '1', activeTab: savedState?.activeTab || [...state.customTabs][0],
+                    isMaximized: savedState?.isMaximized || false, sortOrder: savedState?.sortOrder || 'newest',
+                    layout: savedState?.layout || 'tile', itemSize: savedState?.itemSize || 'standard',
+                    displayMode: savedState?.displayMode || 'full',
+                    position: savedState?.position || { left: '21px', top: '23px' },
+                    size: savedState?.size || { width: '950px', height: '550px' },
+                    isEditing: false
+                };
+
+                const toolbarHandle = document.createElement('div'); toolbarHandle.className = 'toolbarHandle';
+                const menuBar = document.createElement('div'); menuBar.className = 'menuBar';
+                const leftButtons = document.createElement('div'); leftButtons.className = 'left-buttons';
+                const tabMenuBtn = document.createElement('button'); tabMenuBtn.className = 'tabMenuButton'; tabMenuBtn.textContent = 'タブ';
+                const windowMenuBtn = document.createElement('button'); windowMenuBtn.className = 'windowMenuButton'; windowMenuBtn.textContent = 'ウィンドウ';
+                const itemMenuBtn = document.createElement('button'); itemMenuBtn.className = 'itemMenuButton'; itemMenuBtn.textContent = 'アイテム';
+                leftButtons.append(tabMenuBtn, windowMenuBtn, itemMenuBtn);
+                const title = document.createElement('h3'); title.textContent = windowObj.name;
+                const rightButtons = document.createElement('div'); rightButtons.className = 'right-buttons';
+                const debugInfo = document.createElement('span'); debugInfo.className = 'debug-info';
+                const minimizeBtn = document.createElement('button'); minimizeBtn.className = 'minimizeButton'; minimizeBtn.textContent = '─';
+                const maximizeBtn = document.createElement('button'); maximizeBtn.className = 'maximizeButton'; maximizeBtn.textContent = '□';
+                rightButtons.append(debugInfo, minimizeBtn, maximizeBtn);
+                menuBar.append(leftButtons, title, rightButtons);
+
+                const controlBar = document.createElement('div'); controlBar.className = 'controlBar';
+                const editBtn = document.createElement('button'); editBtn.className = 'editButton'; editBtn.textContent = '編集';
+                const layoutBtn = document.createElement('button'); layoutBtn.className = 'layoutButton'; layoutBtn.textContent = 'タイル';
+                const sortSelect = document.createElement('select'); sortSelect.className = 'sortSelect';
+                ['newest:新しい順', 'oldest:古い順', 'extractedDateOldest:抽出日付 古い順', 'extractedDateNewest:抽出日付 新しい順'].forEach(opt => {
+                    const option = document.createElement('option');
+                    const [value, text] = opt.split(':');
+                    option.value = value;
+                    option.textContent = text;
+                    sortSelect.appendChild(option);
+                });
+                const itemSizeSelect = document.createElement('select'); itemSizeSelect.className = 'itemSizeSelect';
+                ['standard:標準', 'half:1/2', 'quarter:1/4'].forEach(opt => {
+                    const option = document.createElement('option');
+                    const [value, text] = opt.split(':');
+                    option.value = value;
+                    option.textContent = text;
+                    itemSizeSelect.appendChild(option);
+                });
+                const displayModeSelect = document.createElement('select'); displayModeSelect.className = 'displayModeSelect';
+                ['full:すべて表示', 'image-only:画像のみ', 'image-title:画像とタイトル'].forEach(opt => {
+                    const option = document.createElement('option');
+                    const [value, text] = opt.split(':');
+                    option.value = value;
+                    option.textContent = text;
+                    displayModeSelect.appendChild(option);
+                });
+                controlBar.append(editBtn, layoutBtn, sortSelect, itemSizeSelect, displayModeSelect);
+
+                const tabSidebar = document.createElement('div'); tabSidebar.className = 'tabSidebar';
+                const savedItems = document.createElement('div'); savedItems.className = 'savedItems';
+                const resizeTop = document.createElement('div'); resizeTop.className = 'resize-handle resize-top';
+                const resizeBottom = document.createElement('div'); resizeBottom.className = 'resize-handle resize-bottom';
+                const resizeLeft = document.createElement('div'); resizeLeft.className = 'resize-handle resize-left';
+                const resizeRight = document.createElement('div'); resizeRight.className = 'resize-handle resize-right';
+
+                fragment.append(toolbarHandle, menuBar, controlBar, tabSidebar, savedItems, resizeTop, resizeBottom, resizeLeft, resizeRight);
+                el.appendChild(fragment);
+                document.body.appendChild(el);
+
+                logMessage(`ウィンドウ ${id} 追加成功`);
+                this.setupEventListeners(windowObj);
+                updateTabs(windowObj);
+                displaySavedItems(windowObj);
+                el.style.left = windowObj.position.left;
+                el.style.top = windowObj.position.top;
+                el.style.width = windowObj.size.width;
+                el.style.height = windowObj.size.height;
+                el.style.display = 'none';
+                return windowObj;
+            } catch (e) {
+                logMessage(`ウィンドウ ${id} 作成失敗: ${e.message}`);
+                return null;
+            }
+        },
+        setupEventListeners(windowObj) {
+            const toolbarHandle = windowObj.el.querySelector('.toolbarHandle'), minimizeButton = windowObj.el.querySelector('.minimizeButton'), maximizeButton = windowObj.el.querySelector('.maximizeButton'), tabMenuButton = windowObj.el.querySelector('.tabMenuButton'), windowMenuButton = windowObj.el.querySelector('.windowMenuButton'), itemMenuButton = windowObj.el.querySelector('.itemMenuButton'), menuBar = windowObj.el.querySelector('.menuBar'), editButton = windowObj.el.querySelector('.editButton'), layoutButton = windowObj.el.querySelector('.layoutButton'), sortSelect = windowObj.el.querySelector('.sortSelect'), itemSizeSelect = windowObj.el.querySelector('.itemSizeSelect'), displayModeSelect = windowObj.el.querySelector('.displayModeSelect'), savedItems = windowObj.el.querySelector('.savedItems'), controlBar = windowObj.el.querySelector('.controlBar'), debugInfo = windowObj.el.querySelector('.debug-info');
+            sortSelect.value = windowObj.sortOrder; events.add(sortSelect, 'change', () => { windowObj.sortOrder = sortSelect.value; GM_setValue(`sortOrder-${windowObj.id}`, windowObj.sortOrder); displaySavedItems(windowObj); this.saveState(windowObj); });
+            itemSizeSelect.value = windowObj.itemSize; events.add(itemSizeSelect, 'change', () => { windowObj.itemSize = itemSizeSelect.value; GM_setValue(`itemSize-${windowObj.id}`, windowObj.itemSize); displaySavedItems(windowObj); this.saveState(windowObj); });
+            displayModeSelect.value = windowObj.displayMode; events.add(displayModeSelect, 'change', () => { windowObj.displayMode = displayModeSelect.value; GM_setValue(`displayMode-${windowObj.id}`, windowObj.displayMode); displaySavedItems(windowObj); this.saveState(windowObj); });
+            events.add(windowObj.el, 'mousedown', () => { bringToFront(windowObj); if (state.activeMenu && !menuBar.contains(event.target) && !state.activeMenu.contains(event.target)) { closeActiveMenu(); state.isHoverEnabled = false; } });
+            const updateDebugInfo = () => debugInfo.textContent = `(${windowObj.el.style.left}, ${windowObj.el.style.top}) ${windowObj.el.style.width}x${windowObj.el.style.height}`; updateDebugInfo();
+            let isDragging = false, offsetX, offsetY;
+            const handleDragMove = (e) => { if (isDragging) { let leftPx = e.clientX - offsetX; let topPx = e.clientY - offsetY; let widthPx = parseInt(windowObj.el.style.width); let heightPx = parseInt(windowObj.el.style.height); leftPx = Math.max(0, Math.min(leftPx, window.innerWidth - widthPx)); topPx = Math.max(0, Math.min(topPx, window.innerHeight - heightPx - 40)); requestAnimationFrame(() => { windowObj.el.style.left = `${leftPx}px`; windowObj.el.style.top = `${topPx}px`; }); } };
+            const handleDragEnd = () => { if (isDragging) { this.saveState(windowObj); isDragging = false; document.removeEventListener('mousemove', handleDragMove); document.removeEventListener('mouseup', handleDragEnd); } };
+            events.add(toolbarHandle, 'mousedown', (e) => { isDragging = true; offsetX = e.clientX - windowObj.el.offsetLeft; offsetY = e.clientY - windowObj.el.offsetTop; e.preventDefault(); document.addEventListener('mousemove', handleDragMove); document.addEventListener('mouseup', handleDragEnd); });
+            let isResizing = false, resizeDir, startX, startY, startWidth, startHeight, startLeft, startTop;
+            const handleResizeMove = (e) => {
+                if (!isResizing) return; let deltaX = e.clientX - startX; let deltaY = e.clientY - startY; let newWidth = startWidth; let newHeight = startHeight; let newLeft = startLeft; let newTop = startTop;
+                if (resizeDir === 'top') { newHeight = startHeight - deltaY; newTop = startTop + deltaY; } else if (resizeDir === 'bottom') { newHeight = startHeight + deltaY; } else if (resizeDir === 'left') { newWidth = startWidth - deltaX; newLeft = startLeft + deltaX; } else if (resizeDir === 'right') { newWidth = startWidth + deltaX; }
+                newWidth = Math.max(200, Math.min(newWidth, window.innerWidth - newLeft)); newHeight = Math.max(150, Math.min(newHeight, window.innerHeight - newTop - 40)); newLeft = Math.max(0, Math.min(newLeft, window.innerWidth - newWidth)); newTop = Math.max(0, Math.min(newTop, window.innerHeight - newHeight - 40));
+                requestAnimationFrame(() => { windowObj.el.style.width = `${newWidth}px`; windowObj.el.style.height = `${newHeight}px`; windowObj.el.style.left = `${newLeft}px`; windowObj.el.style.top = `${newTop}px`; });
+            };
+            const handleResizeEnd = () => { if (isResizing) { this.saveState(windowObj); isResizing = false; document.removeEventListener('mousemove', handleResizeMove); document.removeEventListener('mouseup', handleResizeEnd); } };
+            ['top', 'bottom', 'left', 'right'].forEach(dir => { const handle = windowObj.el.querySelector(`.resize-${dir}`); events.add(handle, 'mousedown', (e) => { isResizing = true; resizeDir = dir; startX = e.clientX; startY = e.clientY; startWidth = parseInt(windowObj.el.style.width); startHeight = parseInt(windowObj.el.style.height); startLeft = parseFloat(windowObj.el.style.left); startTop = parseFloat(windowObj.el.style.top); e.preventDefault(); document.addEventListener('mousemove', handleResizeMove); document.addEventListener('mouseup', handleResizeEnd); }); });
+            events.add(savedItems, 'wheel', (e) => { e.preventDefault(); savedItems.scrollTop += e.deltaY; });
+            events.add(minimizeButton, 'click', () => { windowObj.el.style.display = 'none'; this.saveState(windowObj); Toolbar.elements.toggleWindowButton.textContent = '🖼️'; });
+            events.add(maximizeButton, 'click', () => {
+                if (!windowObj.isMaximized) { windowObj.size = { width: windowObj.el.style.width, height: windowObj.el.style.height }; windowObj.el.style.width = `${window.innerWidth}px`; windowObj.el.style.height = `${window.innerHeight - 40}px`; windowObj.el.style.top = '0'; windowObj.el.style.left = '0'; maximizeButton.textContent = '🗗'; } else { windowObj.el.style.width = windowObj.size.width; windowObj.el.style.height = windowObj.size.height; windowObj.el.style.top = windowObj.position.top; windowObj.el.style.left = windowObj.position.left; maximizeButton.textContent = '□'; }
+                windowObj.isMaximized = !windowObj.isMaximized; this.saveState(windowObj);
+            });
+            const menuButtons = [{ button: tabMenuButton, type: 'tab' }, { button: windowMenuButton, type: 'window' }, { button: itemMenuButton, type: 'item' }];
+            menuButtons.forEach(menu => {
+                events.add(menu.button, 'click', (e) => {
+                    e.preventDefault(); e.stopPropagation();
+                    if (state.isHoverEnabled) { closeActiveMenu(); state.isHoverEnabled = false; logMessage('ホバー状態を解除しました（メニューバー再クリック）'); } else { closeActiveMenu(); state.isHoverEnabled = true; state.activeMenu = this.createSubMenu(windowObj, menu.type, menu.button); addCloseOnClickOutside(state.activeMenu, menuBar); logMessage(`メニューを開きました: ${menu.type}`); }
+                });
+                events.add(menu.button, 'mouseenter', () => { if (state.isHoverEnabled && !state.activePopup) { closeActiveMenu(); state.activeMenu = this.createSubMenu(windowObj, menu.type, menu.button); addCloseOnClickOutside(state.activeMenu, menuBar); logMessage(`ホバーでメニューを開きました: ${menu.type}`); } });
+            });
+                events.add(editButton, 'click', () => {
+        if (windowObj.isEditing) {
+            // 編集モード終了
+            controlBar.querySelectorAll('.moveTabButton, .selectAll, .deselectAll, .deleteSelected').forEach(btn => btn.remove());
+            editButton.textContent = '編集';
+            windowObj.isEditing = false;
+            windowObj.el.classList.remove('editing');
+            savedItems.querySelectorAll('.savedItem').forEach(item => {
+                events.removeAll(item); // 既存のクリックイベントをクリア
+                item.style.cursor = 'pointer';
+                item.classList.remove('selected');
+                const checkbox = item.querySelector('.selectItem');
+                if (checkbox) checkbox.checked = false;
+            });
+            logMessage(`編集モード終了: ${windowObj.id}`);
+        } else {
+            // 編集モード開始
+            const moveTabBtn = document.createElement('button');
+            moveTabBtn.className = 'moveTabButton';
+            moveTabBtn.textContent = '➡';
+            events.add(moveTabBtn, 'click', () => {
+                const checkboxes = savedItems.querySelectorAll('.selectItem:checked');
+                if (!checkboxes.length) return;
+                if (state.activePopup) {
+                    state.activePopup.remove();
+                    state.activePopup = null;
+                }
+                state.activePopup = createMoveTabWindow(windowObj, checkboxes);
+            });
+            const selectAllBtn = document.createElement('button');
+            selectAllBtn.className = 'selectAll';
+            selectAllBtn.textContent = '全選択';
+            events.add(selectAllBtn, 'click', () => {
+                savedItems.querySelectorAll('.selectItem').forEach(cb => {
+                    cb.checked = true;
+                    cb.parentElement.classList.add('selected');
+                });
+            });
+            const deselectAllBtn = document.createElement('button');
+            deselectAllBtn.className = 'deselectAll';
+            deselectAllBtn.textContent = '全解除';
+            events.add(deselectAllBtn, 'click', () => {
+                savedItems.querySelectorAll('.selectItem').forEach(cb => {
+                    cb.checked = false;
+                    cb.parentElement.classList.remove('selected');
+                });
+            });
+            const deleteSelectedBtn = document.createElement('button');
+            deleteSelectedBtn.className = 'deleteSelected';
+            deleteSelectedBtn.textContent = '🗑️';
+            events.add(deleteSelectedBtn, 'click', () => {
+                const checkboxes = savedItems.querySelectorAll('.selectItem:checked');
+                if (!checkboxes.length) return;
+                let allItems = GM_getValue('savedItems', []);
+                checkboxes.forEach(cb => {
+                    const timestamp = cb.parentElement.dataset.timestamp;
+                    allItems = allItems.filter(item => item.timestamp !== timestamp);
+                });
+                GM_setValue('savedItems', allItems);
+                displaySavedItems(windowObj);
+            });
+            controlBar.insertBefore(moveTabBtn, controlBar.querySelector('.layoutButton'));
+            controlBar.insertBefore(selectAllBtn, controlBar.querySelector('.layoutButton'));
+            controlBar.insertBefore(deselectAllBtn, controlBar.querySelector('.layoutButton'));
+            controlBar.insertBefore(deleteSelectedBtn, controlBar.querySelector('.layoutButton'));
+            editButton.textContent = '終了';
+            windowObj.isEditing = true;
+            windowObj.el.classList.add('editing');
+            addItemClickListeners(windowObj, savedItems.querySelectorAll('.savedItem'));
+            logMessage(`編集モード開始: ${windowObj.id}`);
+        }
+    });
+    events.add(layoutButton, 'click', () => {
+        windowObj.layout = windowObj.layout === 'tile' ? 'column' : 'tile';
+        GM_setValue(`layout-${windowObj.id}`, windowObj.layout);
+        layoutButton.textContent = windowObj.layout === 'tile' ? 'タイル' : '1列';
+        displaySavedItems(windowObj);
+        Window.saveState(windowObj);
+    });
+
+            events.add(layoutButton, 'click', () => { windowObj.layout = windowObj.layout === 'tile' ? 'column' : 'tile'; GM_setValue(`layout-${windowObj.id}`, windowObj.layout); layoutButton.textContent = windowObj.layout === 'tile' ? 'タイル' : '1列'; displaySavedItems(windowObj); this.saveState(windowObj); });
+            layoutButton.textContent = windowObj.layout === 'tile' ? 'タイル' : '1列';
+            logMessage(`ウィンドウ ${windowObj.id} リスナー設定完了`);
+        },
+        createSubMenu(windowObj, type, button) {
+            const subMenu = document.createElement('div'); subMenu.className = 'subMenu';
+            const menuBar = button.closest('.menuBar');
+            const menuBarRect = menuBar.getBoundingClientRect();
+            const buttonRect = button.getBoundingClientRect();
+            const windowRect = windowObj.el.getBoundingClientRect();
+            subMenu.style.position = 'absolute'; subMenu.style.left = `${buttonRect.left - windowRect.left}px`; subMenu.style.top = `${menuBarRect.height}px`;
+            const fragment = document.createDocumentFragment();
+            const items = type === 'tab' ? [{ text: 'タブ管理', action: () => createTabManageWindow(windowObj) }] : type === 'window' ? [] : [{ text: 'すべてのアイテムを削除', action: () => { if (confirm('すべてのアイテムを削除しますか？')) { GM_setValue('savedItems', []); displaySavedItems(windowObj); } } }];
+            items.forEach(item => {
+                const menuItem = document.createElement('div'); menuItem.textContent = item.text; menuItem.className = 'subMenuItem';
+                events.add(menuItem, 'click', (e) => { e.stopPropagation(); closeActiveMenu(); if (state.activePopup) { state.activePopup.remove(); state.activePopup = null; } state.activePopup = item.action(); bringToFrontPopup(state.activePopup); });
+                events.add(menuItem, 'mouseenter', () => menuItem.style.backgroundColor = '#ddd');
+                events.add(menuItem, 'mouseleave', () => menuItem.style.backgroundColor = '#f0f0f0');
+                fragment.appendChild(menuItem);
+            });
+            subMenu.appendChild(fragment);
+            windowObj.el.appendChild(subMenu);
+            return subMenu;
+        },
+        saveState(windowObj) {
+            const savedState = {
+                name: windowObj.name, activeTab: windowObj.activeTab, isMaximized: windowObj.isMaximized,
+                sortOrder: windowObj.sortOrder, layout: windowObj.layout, itemSize: windowObj.itemSize,
+                displayMode: windowObj.displayMode,
+                position: { left: windowObj.el.style.left, top: windowObj.el.style.top },
+                size: { width: windowObj.el.style.width, height: windowObj.el.style.height },
+                display: windowObj.el.style.display
+            };
+            GM_setValue(`windowState-${windowObj.id}`, savedState);
+        }
+    };
+
+    const saveImage = () => {
+        if (!state.currentCompressedImage || !state.window) { logMessage('保存失敗: 画像なしまたはウィンドウなし'); return; }
+        const domain = window.location.hostname; const { tags, extractedDate } = extractTagsAndDate(); const favicon = getFaviconForNewTab(domain, window.location.href); const savedData = { image: state.currentCompressedImage, url: window.location.href, title: document.title, favicon, timestamp: new Date().toISOString(), tab: domain, tags, extractedDate };
+        const allItems = GM_getValue('savedItems', []); allItems.push(savedData); GM_setValue('savedItems', allItems); state.window.activeTab = domain; updateTabs(state.window); displaySavedItems(state.window); logMessage('画像とタグ、日付保存成功');
+    };
+
+    const extractTagsAndDate = () => {
+        const tags = new Set(); let extractedDate = null;
+        document.querySelectorAll('div.q-chip').forEach(el => { const content = el.querySelector('.q-chip__content'); if (content && content.textContent.trim()) { const tagText = content.textContent.trim(); if (tagText.length > 0 && tagText.length < 20) tags.add(tagText); } });
+        const dateElement = document.querySelector('div.absolute-bottom-right'); if (dateElement && dateElement.textContent.trim()) extractedDate = dateElement.textContent.trim();
+        const tagArray = [...tags]; logMessage(`タグ抽出完了: ${tagArray.length}個 (${tagArray.join(', ')}), 日付: ${extractedDate || 'なし'}`); return { tags: tagArray, extractedDate };
+    };
+
+    const getFaviconForNewTab = (tab, url) => {
+        const allItems = GM_getValue('savedItems', []); const existingTab = allItems.find(item => item.tab === tab);
+        if (existingTab) { logMessage(`既存タブ ${tab} のファビコンを再利用`); return existingTab.favicon; }
+        const favicon = document.querySelector('link[rel="icon"]')?.href || 'data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><circle cx="8" cy="8" r="7" fill="#104437"/></svg>';
+        logMessage(`ファビコン取得: ${favicon}`); return favicon;
+    };
+
+    const updateTabs = (windowObj) => {
+        const tabSidebar = windowObj.el.querySelector('.tabSidebar'); tabSidebar.innerHTML = '';
+        const allItems = GM_getValue('savedItems', []); const autoTabs = new Set(allItems.map(item => item.tab).filter(t => !state.customTabs.has(t))); const allTabs = [...state.customTabs, ...autoTabs];
+        const fragment = document.createDocumentFragment();
+        allTabs.forEach(tab => {
+            const tabButton = document.createElement('button'); tabButton.className = 'tab-vertical'; tabButton.dataset.tab = tab;
+            const favicon = allItems.find(item => item.tab === tab)?.favicon;
+            tabButton.innerHTML = favicon && !state.customTabs.has(tab) && !state.tabThumbnails.has(tab) ? `<img src="${favicon}">` : `<span>${state.tabThumbnails.get(tab) || tab[0]}</span>`;
+            tabButton.style.backgroundColor = state.tabColors.get(tab) || '#104437'; tabButton.title = tab;
+            events.add(tabButton, 'click', () => { windowObj.activeTab = tab; GM_setValue(`activeTab-${windowObj.id}`, tab); tabSidebar.querySelectorAll('.tab-vertical').forEach(t => t.classList.remove('active')); tabButton.classList.add('active'); bringToFront(windowObj); displaySavedItems(windowObj); Window.saveState(windowObj); });
+            fragment.appendChild(tabButton);
+            if (tab === windowObj.activeTab) tabButton.classList.add('active');
+        });
+        tabSidebar.appendChild(fragment);
+    };
+
+    const displaySavedItems = (windowObj) => {
+        const savedItems = GM_getValue('savedItems', []).filter(item => item.tab === windowObj.activeTab); let sortedItems = [...savedItems];
+        if (windowObj.sortOrder === 'newest') sortedItems.sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
+        else if (windowObj.sortOrder === 'oldest') sortedItems.sort((a, b) => new Date(a.timestamp) - new Date(a.timestamp));
+        else if (windowObj.sortOrder === 'extractedDateOldest') { const itemsWithDate = sortedItems.filter(item => item.extractedDate); const itemsWithoutDate = sortedItems.filter(item => !item.extractedDate); itemsWithDate.sort((a, b) => new Date(a.extractedDate) - new Date(b.extractedDate)); sortedItems = [...itemsWithDate, ...itemsWithoutDate]; }
+        else if (windowObj.sortOrder === 'extractedDateNewest') { const itemsWithDate = sortedItems.filter(item => item.extractedDate); const itemsWithoutDate = sortedItems.filter(item => !item.extractedDate); itemsWithDate.sort((a, b) => new Date(b.extractedDate) - new Date(a.extractedDate)); sortedItems = [...itemsWithDate, ...itemsWithoutDate]; }
+        const itemsDiv = windowObj.el.querySelector('.savedItems'); itemsDiv.className = `savedItems ${windowObj.layout === 'column' ? 'column' : ''}`; itemsDiv.innerHTML = '';
+        const fragment = document.createDocumentFragment();
+        sortedItems.forEach(item => {
+            const a = document.createElement('a'); a.href = item.url; a.target = '_blank'; a.className = `savedItem ${windowObj.layout === 'column' ? 'column' : ''} size-${windowObj.itemSize} ${windowObj.displayMode === 'image-only' ? 'image-only' : ''} ${windowObj.displayMode === 'image-title' ? 'image-title' : ''}`; a.dataset.timestamp = item.timestamp;
+            const checkbox = document.createElement('input'); checkbox.type = 'checkbox'; checkbox.className = 'selectItem'; a.appendChild(checkbox);
+            const img = document.createElement('img'); img.src = item.image; img.alt = '圧縮画像'; a.appendChild(img);
+            const titleP = document.createElement('p'); const titleStrong = document.createElement('strong'); titleStrong.textContent = ' '; titleP.appendChild(titleStrong); titleP.appendChild(document.createTextNode(item.title)); a.appendChild(titleP);
+            if (windowObj.displayMode === 'full') {
+                const urlP = document.createElement('p'); const urlStrong = document.createElement('strong'); urlStrong.textContent = 'URL: '; urlP.appendChild(urlStrong); const urlSpan = document.createElement('span'); urlSpan.textContent = 'link'; urlP.appendChild(urlSpan); a.appendChild(urlP);
+                const tagsP = document.createElement('p'); const tagsStrong = document.createElement('strong'); tagsStrong.textContent = 'タグ: '; tagsP.appendChild(tagsStrong); tagsP.appendChild(document.createTextNode(item.tags ? item.tags.join(', ') : 'なし')); a.appendChild(tagsP);
+                const dateP = document.createElement('p'); const dateStrong = document.createElement('strong'); dateStrong.textContent = '抽出日付: '; dateP.appendChild(dateStrong); dateP.appendChild(document.createTextNode(item.extractedDate || 'なし')); a.appendChild(dateP);
+                const saveDateP = document.createElement('p'); const saveDateStrong = document.createElement('strong'); saveDateStrong.textContent = '保存日時: '; saveDateP.appendChild(saveDateStrong); saveDateP.appendChild(document.createTextNode(new Date(item.timestamp).toLocaleString())); a.appendChild(saveDateP);
+            }
+            fragment.appendChild(a);
+        });
+        itemsDiv.appendChild(fragment);
+        if (windowObj.isEditing) addItemClickListeners(windowObj, itemsDiv.querySelectorAll('.savedItem')); else itemsDiv.querySelectorAll('.savedItem').forEach(item => item.style.cursor = 'pointer');
+    };
+
+    // 3. アイテムクリックリスナーの修正: addItemClickListeners関数を置換
+    const addItemClickListeners = (windowObj, items) => {
+        items.forEach(item => {
+            events.removeAll(item); // 既存のイベントリスナーをクリア
+            item.style.cursor = 'pointer';
+            events.add(item, 'click', (e) => {
+                if (windowObj.isEditing) {
+                    e.preventDefault();
+                    const checkbox = item.querySelector('.selectItem');
+                    if (checkbox) {
+                        checkbox.checked = !checkbox.checked;
+                        item.classList.toggle('selected', checkbox.checked);
+                        // アニメーションを追加
+                        item.animate([
+                            { transform: 'scale(1)', backgroundColor: '#104437' },
+                            { transform: 'scale(1.05)', backgroundColor: '#16a085' },
+                            { transform: 'scale(1)', backgroundColor: '#104437' }
+                        ], {
+                            duration: 200,
+                            easing: 'ease-in-out'
+                        });
+                        logMessage(`アイテムクリック: timestamp=${item.dataset.timestamp}, 選択状態=${checkbox.checked}`);
+                    }
+                }
+            });
+        });
+    };
+    const createLogWindow = () => {
+        let existingWindow = document.querySelector('#logWindow'); if (existingWindow) existingWindow.remove();
+        const logWindow = document.createElement('div'); logWindow.id = 'logWindow';
+        const fragment = document.createDocumentFragment();
+        const menuBar = document.createElement('div'); menuBar.className = 'menuBar';
+        const title = document.createElement('h3'); title.textContent = 'log';
+        const closeBtn = document.createElement('button'); closeBtn.className = 'closeLog'; closeBtn.textContent = '×';
+        menuBar.append(title, closeBtn);
+        const logContent = document.createElement('div'); logContent.id = 'logContent';
+        fragment.append(menuBar, logContent);
+        logWindow.appendChild(fragment);
+        document.body.appendChild(logWindow);
+
+        const toolbar = document.getElementById('toolbar'); if (toolbar) { logWindow.style.left = `${toolbar.offsetLeft / window.innerWidth * 100}vw`; logWindow.style.top = `${(toolbar.offsetTop + toolbar.offsetHeight + 10) / window.innerHeight * 100}vh`; }
+        const debugOutput = document.getElementById('debugOutput'); if (debugOutput) { debugOutput.querySelectorAll('p').forEach(p => { const logP = document.createElement('p'); logP.textContent = p.textContent; logContent.appendChild(logP); }); logContent.scrollTop = logContent.scrollHeight; }
+        let isDragging = false, offsetX, offsetY;
+        const handleMouseMove = (e) => { if (isDragging) { let leftPx = e.clientX - offsetX; let topPx = e.clientY - offsetY; let widthPx = logWindow.offsetWidth; let heightPx = logWindow.offsetHeight; leftPx = Math.max(0, Math.min(leftPx, window.innerWidth - widthPx)); topPx = Math.max(0, Math.min(topPx, window.innerHeight - heightPx)); requestAnimationFrame(() => { logWindow.style.left = `${leftPx}px`; logWindow.style.top = `${topPx}px`; }); } };
+        const handleMouseUp = () => { if (isDragging) { isDragging = false; document.removeEventListener('mousemove', handleMouseMove); document.removeEventListener('mouseup', handleMouseUp); } };
+        events.add(menuBar, 'mousedown', (e) => { if (e.target.tagName !== 'BUTTON') { isDragging = true; offsetX = e.clientX - logWindow.offsetLeft; offsetY = e.clientY - logWindow.offsetTop; e.preventDefault(); document.addEventListener('mousemove', handleMouseMove); document.addEventListener('mouseup', handleMouseUp); } });
+        events.add(closeBtn, 'click', () => logWindow.remove());
+        bringToFrontPopup(logWindow);
+    };
+
+    const createMoveTabWindow = (parentWindow, checkboxes) => {
+        if (state.activePopup) { state.activePopup.remove(); state.activePopup = null; }
+        const moveTabDiv = document.createElement('div'); moveTabDiv.className = 'moveTabPopup';
+        const fragment = document.createDocumentFragment();
+        const menuBar = document.createElement('div'); menuBar.className = 'menuBar';
+        const title = document.createElement('h3'); title.textContent = `タブ移動 - ${parentWindow.name}`;
+        const closeBtn = document.createElement('button'); closeBtn.className = 'closeMoveTab'; closeBtn.textContent = '×';
+        menuBar.append(title, closeBtn);
+        const content = document.createElement('div'); content.className = 'moveTabContent'; content.style.padding = '10px';
+        fragment.append(menuBar, content);
+        moveTabDiv.appendChild(fragment);
+        document.body.appendChild(moveTabDiv);
+        state.activePopup = moveTabDiv;
+        bringToFrontPopup(moveTabDiv);
+
+        const allItems = GM_getValue('savedItems', []); const autoTabs = new Set(allItems.map(item => item.tab).filter(t => !state.customTabs.has(t))); const allTabs = [...state.customTabs, ...autoTabs];
+        const contentFragment = document.createDocumentFragment();
+        allTabs.forEach(tab => {
+            const btn = document.createElement('button'); btn.textContent = tab;
+            events.add(btn, 'click', () => {
+                let allItems = GM_getValue('savedItems', []);
+                checkboxes.forEach(cb => { const timestamp = cb.parentElement.dataset.timestamp; const item = allItems.find(i => i.timestamp === timestamp); if (item) item.tab = tab; });
+                GM_setValue('savedItems', allItems); displaySavedItems(parentWindow); moveTabDiv.remove(); state.activePopup = null;
+            });
+            contentFragment.appendChild(btn);
+        });
+        content.appendChild(contentFragment);
+        events.add(closeBtn, 'click', () => { moveTabDiv.remove(); state.activePopup = null; });
+        return moveTabDiv;
+    };
+
+    const createTabManageWindow = (parentWindow) => {
+        if (state.activePopup) { state.activePopup.remove(); state.activePopup = null; }
+        const tabManageDiv = document.createElement('div'); tabManageDiv.className = 'tabMenuPopup';
+        const fragment = document.createDocumentFragment();
+        const menuBar = document.createElement('div'); menuBar.className = 'menuBar';
+        const title = document.createElement('h3'); title.textContent = `タブ管理 - ${parentWindow.name}`;
+        const closeBtn = document.createElement('button'); closeBtn.className = 'closeTabManage'; closeBtn.textContent = '×';
+        menuBar.append(title, closeBtn);
+        const content = document.createElement('div'); content.className = 'tabManageContent'; content.style.padding = '10px';
+        const label = document.createElement('label'); label.textContent = 'タブ名: ';
+        const input = document.createElement('input'); input.type = 'text'; input.id = 'tabNameInput'; input.placeholder = '新規タブ';
+        label.appendChild(input);
+        const addBtn = document.createElement('button'); addBtn.id = 'addTabConfirm'; addBtn.textContent = '追加';
+        const hr = document.createElement('hr');
+        const settingsTitle = document.createElement('h4'); settingsTitle.textContent = 'タブ設定';
+        const settingsDiv = document.createElement('div'); settingsDiv.id = 'tabSettings';
+        content.append(label, addBtn, hr, settingsTitle, settingsDiv);
+        fragment.append(menuBar, content);
+        tabManageDiv.appendChild(fragment);
+        document.body.appendChild(tabManageDiv);
+        state.activePopup = tabManageDiv;
+        bringToFrontPopup(tabManageDiv);
+
+        const allItems = GM_getValue('savedItems', []); const autoTabs = new Set(allItems.map(item => item.tab).filter(t => !state.customTabs.has(t))); const allTabs = [...state.customTabs, ...autoTabs];
+        const settingsFragment = document.createDocumentFragment();
+        allTabs.forEach(tab => {
+            const div = document.createElement('div');
+            const favicon = allItems.find(item => item.tab === tab)?.favicon;
+            div.innerHTML = favicon && !state.customTabs.has(tab) && !state.tabThumbnails.has(tab) ? `<img src="${favicon}" width="16" height="16">` : `<span>${state.tabThumbnails.get(tab) || tab[0]}</span>`;
+            div.style.display = 'inline-block'; div.style.marginRight = '5px'; div.style.backgroundColor = state.tabColors.get(tab) || '#104437';
+            const deleteBtn = document.createElement('button'); deleteBtn.textContent = '削除';
+            events.add(deleteBtn, 'click', () => {
+                if (confirm(`${tab}タブを削除しますか？（関連アイテムも削除されます）`)) {
+                    if (state.customTabs.has(tab)) { state.customTabs.delete(tab); state.updateCustomTabs([...state.customTabs]); }
+                    const updatedItems = allItems.filter(item => item.tab !== tab); GM_setValue('savedItems', updatedItems);
+                    state.tabColors.delete(tab); state.tabThumbnails.delete(tab);
+                    if (parentWindow.activeTab === tab) parentWindow.activeTab = state.customTabs.values().next().value || '';
+                    updateTabs(parentWindow); content.removeChild(div);
+                }
+            });
+            const colorBtn = document.createElement('button'); colorBtn.textContent = '色'; events.add(colorBtn, 'click', () => setupTabColorMenu(tab, div, settingsDiv));
+            const thumbnailBtn = document.createElement('button'); thumbnailBtn.textContent = 'サムネイル'; events.add(thumbnailBtn, 'click', () => setupTabThumbnailMenu(tab, div, favicon, settingsDiv));
+            div.append(deleteBtn, colorBtn, thumbnailBtn);
+            settingsFragment.appendChild(div);
+        });
+        settingsDiv.appendChild(settingsFragment);
+        const handleAddTab = () => { const tabName = input.value; if (tabName && !state.customTabs.has(tabName)) { state.customTabs.add(tabName); state.updateCustomTabs([...state.customTabs]); updateTabs(parentWindow); cleanupTabManage(tabManageDiv); } };
+        events.add(addBtn, 'click', handleAddTab);
+        events.add(closeBtn, 'click', () => cleanupTabManage(tabManageDiv));
+        return tabManageDiv;
+    };
+
+    const setupTabColorMenu = (tab, div, settingsDiv) => {
+        const colorMenu = document.createElement('div'); colorMenu.className = 'tabMenu';
+        colorMenu.style.position = 'absolute'; colorMenu.style.left = `${div.offsetLeft + div.offsetWidth}px`; colorMenu.style.top = `${div.offsetTop}px`;
+        const fragment = document.createDocumentFragment();
+        Window.colorPresets.forEach((color, name) => {
+            const btn = document.createElement('button'); btn.textContent = name; btn.style.backgroundColor = color;
+            events.add(btn, 'click', () => { state.setTabColor(tab, color); div.style.backgroundColor = color; updateTabs(state.window); colorMenu.remove(); });
+            fragment.appendChild(btn);
+        });
+        const resetColorBtn = document.createElement('button'); resetColorBtn.textContent = 'デフォルト色に戻す';
+        events.add(resetColorBtn, 'click', () => { state.tabColors.delete(tab); GM_setValue('tabColors', Object.fromEntries(state.tabColors)); div.style.backgroundColor = '#104437'; updateTabs(state.window); colorMenu.remove(); });
+        fragment.appendChild(resetColorBtn);
+        colorMenu.appendChild(fragment);
+        settingsDiv.appendChild(colorMenu);
+    };
+
+    const setupTabThumbnailMenu = (tab, div, favicon, settingsDiv) => {
+        const thumbMenu = document.createElement('div'); thumbMenu.className = 'tabMenu';
+        thumbMenu.style.position = 'absolute'; thumbMenu.style.left = `${div.offsetLeft + div.offsetWidth}px`; thumbMenu.style.top = `${div.offsetTop}px`;
+        const fragment = document.createDocumentFragment();
+        Window.thumbnailPresets.forEach(emoji => {
+            const btn = document.createElement('button'); btn.textContent = emoji;
+            events.add(btn, 'click', () => { state.setTabThumbnail(tab, emoji); div.innerHTML = `<span>${emoji}</span>`; updateTabs(state.window); thumbMenu.remove(); });
+            fragment.appendChild(btn);
+        });
+        const resetBtn = document.createElement('button'); resetBtn.textContent = '元のファビコン';
+        events.add(resetBtn, 'click', () => { state.tabThumbnails.delete(tab); GM_setValue('tabThumbnails', Object.fromEntries(state.tabThumbnails)); div.innerHTML = favicon && !state.customTabs.has(tab) ? `<img src="${favicon}" width="16" height="16">` : `<span>${tab[0]}</span>`; updateTabs(state.window); thumbMenu.remove(); });
+        fragment.appendChild(resetBtn);
+        thumbMenu.appendChild(fragment);
+        settingsDiv.appendChild(thumbMenu);
+    };
+
+    const cleanupTabManage = (tabManageDiv) => { tabManageDiv.querySelectorAll('button').forEach(btn => btn.replaceWith(btn.cloneNode(true))); tabManageDiv.remove(); state.activePopup = null; };
+
+    const bringToFront = (windowObj) => { state.zIndexCounter++; if (state.activePopup && state.zIndexCounter >= parseInt(state.activePopup.style.zIndex)) state.zIndexCounter = parseInt(state.activePopup.style.zIndex) + 1; windowObj.el.style.zIndex = state.zIndexCounter; };
+
+    const bringToFrontPopup = (popup) => { state.zIndexCounter = Math.max(state.zIndexCounter + 1, 20000); popup.style.zIndex = state.zIndexCounter; };
+
+    const addCloseOnClickOutside = (menu, menuBar) => {
+        const closeMenu = (e) => { logMessage(`外部クリック検知: target=${e.target.tagName}, menuBar=${menuBar.contains(e.target)}, menu=${menu.contains(e.target)}`); setTimeout(() => { if (!menuBar.contains(e.target) && !menu.contains(e.target)) { logMessage('サブメニューを閉じます'); closeActiveMenu(); state.isHoverEnabled = false; document.removeEventListener('click', closeMenu); } }, 0); };
+        document.addEventListener('click', closeMenu); menu.addEventListener('remove', () => { document.removeEventListener('click', closeMenu); logMessage('サブメニュー削除に伴いリスナー解除'); }, { once: true });
+    };
+
+    const closeActiveMenu = () => { if (state.activeMenu) { state.activeMenu.remove(); state.activeMenu = null; } };
+
+    const init = () => {
+        const toolbarElements = Toolbar.init(); if (!toolbarElements) { logMessage("ツールバー初期化失敗、中止"); return; }
+        let toolbarLeft = Math.max(0, Math.min(window.innerWidth - 80, parseFloat(GM_getValue('toolbarPosition', { left: window.innerWidth - 80 }).left) || 0));
+        let toolbarTop = Math.max(0, Math.min(window.innerHeight - 100, parseFloat(GM_getValue('toolbarPosition', { top: 50 }).top) || 50));
+        toolbarElements.toolbar.style.left = `${toolbarLeft}px`;
+        toolbarElements.toolbar.style.top = `${toolbarTop}px`;
+        toolbarElements.toolbar.style.right = 'auto';
+        logMessage("ツールバー位置設定完了");
+
+        // フルスクリーン検知
+        events.add(document, 'fullscreenchange', () => {
+            if (document.fullscreenElement) {
+                toolbarElements.toolbar.style.display = 'none';
+                logMessage("フルスクリーン検知: ツールバーを非表示");
+            } else {
+                toolbarElements.toolbar.style.display = 'block';
+                logMessage("フルスクリーン解除: ツールバーを表示");
+            }
+        });
+
+        const savedWindowId = GM_getValue('savedWindow', null);
+        if (savedWindowId) {
+            const savedState = GM_getValue(`windowState-${savedWindowId}`, { position: { left: '21px', top: '23px' }, size: { width: '950px', height: '550px' } });
+            const windowObj = Window.create(savedWindowId, savedState);
+            if (windowObj) state.setWindow(windowObj);
+        }
+
+        window.onresize = () => {
+            requestAnimationFrame(() => {
+                const toolbarPos = GM_getValue('toolbarPosition', { left: `${toolbarLeft}px`, top: `${toolbarTop}px` });
+                toolbarElements.toolbar.style.left = `${Math.max(0, Math.min(parseFloat(toolbarPos.left), window.innerWidth - 80))}px`;
+                toolbarElements.toolbar.style.top = `${Math.max(0, Math.min(parseFloat(toolbarPos.top), window.innerHeight - 100))}px`;
+                if (state.window && state.window.isMaximized) state.window.el.querySelector('.maximizeButton').click();
+            });
+        };
+        logMessage("初期化完了");
+        GM_addStyle(`@import url('https://fonts.googleapis.com/css2?family=Montserrat:wght@700&display=swap');#toolbar{position:fixed;top:5vh;right:2vw;height:450px;width:25px;background-color:#082849;border:2px solid #104437;padding:5px;z-index:9999;box-shadow:0 4px 8px rgba(0,0,0,0.2);font-family:sans-serif;color:#fff;user-select:none;overflow:auto;}#toolbarHandle{height:20px;background-color:#104437;cursor:move;margin-bottom:5px;}#toolbar button,#toolbar textarea,#toolbar select,#toolbar input[type="checkbox"]{display:block;width:100%;margin:5px 0;padding:5px;font-size:12px;background-color:#104437;color:#fff;border:none;cursor:pointer;border-radius:5px;}#selectImageButton.active,#selectVideoThumbnailButton.active,#extractTagsButton.active{background-color:#3c9d6f;}#toolbar button:hover{background-color:#16a085;}#compressionButtons button.selected{background-color:#e67e22;}#pasteImageArea{height:20px;border:1px solid #16a085;}#compressedImage{max-width:100%;margin:5px 0;}#compressionRate{font-size:12px;margin:5px 0;}#debugOutput{display:none;}.window{position:fixed;width:950px;height:550px;background-color:#082849;border:2px solid #104437;padding:5px;z-index:10000;box-shadow:0 4px 8px rgba(0,0,0,0.2);font-family:sans-serif;color:#fff;user-select:none;overflow:hidden;}.toolbarHandle{height:20px;background-color:#104437;cursor:move;margin-bottom:5px;}.menuBar{display:flex;justify-content:space-between;padding:2px;background-color:#104437;height:20px;align-items:center;}.window .menuBar h3{margin:0;flex-grow:1;text-align:center;font-size:14px;}.left-buttons,.right-buttons{display:flex;gap:2px;}.window .menuBar button{padding:1px 3px;background-color:#082849;color:#fff;border:none;cursor:pointer;border-radius:3px;font-size:12px;}.minimizeButton,.maximizeButton{background-color:#104437!important;width:32px;height:32px;font-size:32px;padding:0;line-height:32px;}.window .menuBar button:hover{background-color:#16a085;}.debug-info{font-size:12px;white-space:nowrap;margin-left:5px;}.tabSidebar{position:absolute;left:0;top:110px;bottom:5px;width:60px!important;display:flex;flex-direction:column;gap:5px;padding:5px;overflow-y:auto;}.tab-vertical{width:100%;padding:5px;border:none;color:#fff;cursor:pointer;text-align:center;background-color:#104437;border-radius:5px;}.tab-vertical.active{background:#16a085;box-shadow:0 0 5px 4px rgba(255,255,255,0.7);transform:scale(1.2);z-index:1;}.tab-vertical img{width:24px;height:24px;}.tab-vertical span{font-family:'Montserrat',sans-serif;font-size:16px;}.controlBar{padding:5px;display:flex;gap:5px;flex-wrap:wrap;justify-content:flex-start;margin-left:60px;margin-top:25px;}.controlBar button,.controlBar select{padding:5px;background:#104437;color:#fff;border:none;font-size:12px;}.controlBar button:hover{background-color:#16a085;}.savedItems{margin-left:60px;margin-top:0;max-height:calc(100% - 80px);overflow-y:auto;padding:5px;display:flex;flex-wrap:wrap;gap:10px;}.savedItems.column{flex-direction:column;flex-wrap:nowrap;}.savedItem{padding:5px;background:#104437;border-radius:5px;position:relative;cursor:pointer;text-decoration:none;color:#fff;}.savedItem.column{flex:1 0 100%;}.savedItem.size-standard{flex:0 0 300px;}.savedItem.size-half{flex:0 0 250px;}.savedItem.size-quarter{flex:0 0 200px;}.savedItem.selected{border:2px solid #16a085;}.savedItem img{max-width:100%;}.savedItem p{margin:2px 0;font-size:12px;}.savedItem.image-only p{display:none;}.savedItem.image-title p:not(:nth-child(3)){display:none;font-size:100px!important;}.savedItem.image-title p:nth-child(3){display:block;font-size:18px!important;}.savedItem a{color:#fff;}.selectItem{position:absolute;top:5px;left:5px;width:20px;height:20px;z-index:1;display:none;}.editing .selectItem{display:block;}.subMenu{position:absolute;background-color:#082849;border:1px solid #104437;box-shadow:0 2px 5px rgba(0,0,0,0.2);min-width:100px;z-index:10001;margin-top:30px;}.subMenuItem{padding:2px 5px;cursor:pointer;background-color:#082849!important;white-space:nowrap;font-size:14px;color:#fff;}.subMenuItem:hover{background-color:#16a085!important;color:#fff!important;}#logWindow{position:fixed;width:200px;height:150px;background:#082849;border:2px solid #104437;padding:5px;z-index:10002;box-shadow:0 4px 8px rgba(0,0,0,0.2);font-family:sans-serif;color:#fff;user-select:none;overflow:hidden;}#logWindow .menuBar{display:flex;justify-content:space-between;padding:2px;background-color:#104437;cursor:move;height:20px;align-items:center;}#logWindow .menuBar h3{margin:0;flex-grow:1;text-align:center;font-size:12px;}#logWindow .menuBar button{padding:1px 3px;background-color:#082849;color:#fff;border:none;cursor:pointer;border-radius:3px;font-size:12px;}#logWindow .menuBar button:hover{background-color:#16a085;}#logContent{max-height:calc(100% - 25px);overflow-y:auto;background:#333;padding:5px;font-size:10px;color:#fff;}.tabMenuPopup,.moveTabPopup{position:fixed;background-color:#082849;border:2px solid #104437;padding:5px;z-index:10001;box-shadow:0 4px 8px rgba(0,0,0,0.2);font-family:sans-serif;color:#fff;width:300px;height:400px;left:50%;top:50%;transform:translate(-50%,-50%);overflow-y:auto;}.tabMenuPopup .menuBar,.moveTabPopup .menuBar{display:flex;justify-content:space-between;padding:2px;background-color:#104437;height:20px;align-items:center;}.tabMenuPopup .menuBar h3,.moveTabPopup .menuBar h3{margin:0;flex-grow:1;text-align:center;font-size:14px;}.tabMenuPopup .menuBar button,.moveTabPopup .menuBar button{padding:1px 3px;background-color:#082849;color:#fff;border:none;cursor:pointer;border-radius:3px;font-size:12px;}.tabMenuPopup .menuBar button:hover,.moveTabPopup .menuBar button:hover{background-color:#16a085;}.moveTabContent{overflow-y:auto;padding:5px;}.resize-handle{position:absolute;background:transparent;}.resize-top{top:-5px;left:0;width:100%;height:10px;cursor:ns-resize;}.resize-bottom{bottom:-5px;left:0;width:100%;height:10px;cursor:ns-resize;}.resize-left{left:-5px;top:0;width:10px;height:100%;cursor:ew-resize;}.resize-right{right:-5px;top:0;width:10px;height:100%;cursor:ew-resize;}`);
+    };
+
+    init();
+})();
