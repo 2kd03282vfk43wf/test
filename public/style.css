@@ -1,10 +1,12 @@
-/* public/style.css */
+@import url('https://fonts.googleapis.com/css2?family=Montserrat:wght@700&display=swap');
+
+/* ツールバー */
 #toolbar {
   position: fixed;
   top: 5vh;
-  left: 2vw;
+  right: 2vw;
   height: 450px;
-  width: 45px;
+  width: 25px;
   background-color: #082849;
   color: #fff;
   border-radius: 8px;
@@ -16,13 +18,41 @@
   gap: 6px;
   padding: 10px 0;
   font-family: 'Montserrat', Arial, sans-serif;
+  user-select: none;
 }
-
 #toolbar button,
 #toolbar input[type="checkbox"] {
   margin: 4px 0;
 }
+#toolbar textarea {
+  width: 30px;
+  height: 30px;
+  resize: none;
+  border: 1px solid #888;
+  border-radius: 4px;
+  padding: 2px;
+  font-size: 13px;
+  background: #e8f0ff;
+  color: #333;
+}
+#toolbar #compressionButtons button.selected {
+  background: #ff9800;
+  color: #fff;
+}
+#toolbar .active {
+  background: #16a085;
+  color: #fff;
+}
+#toolbarHandle {
+  width: 22px;
+  height: 8px;
+  background: #aaa;
+  border-radius: 4px;
+  margin-bottom: 8px;
+  cursor: grab;
+}
 
+/* ウィンドウ */
 .window {
   position: fixed;
   left: 100px;
@@ -36,8 +66,12 @@
   z-index: 10000;
   padding: 10px;
   font-family: 'Montserrat', Arial, sans-serif;
+  display: flex;
+  flex-direction: column;
+  min-width: 320px;
+  min-height: 200px;
+  overflow: visible;
 }
-
 .menuBar {
   display: flex;
   justify-content: space-between;
@@ -47,38 +81,61 @@
   border-radius: 6px 6px 0 0;
   padding: 6px 12px;
 }
-
-.savedItems {
-  overflow-y: auto;
-  height: 350px;
-  background: #e5ecef;
-  padding: 8px;
-  border-radius: 0 0 8px 8px;
-  margin-top: 10px;
+.left-buttons, .right-buttons {
   display: flex;
-  flex-wrap: wrap;
-  gap: 8px;
-}
-
-.savedItem {
-  background: #fff;
-  border: 1px solid #ccd;
-  border-radius: 6px;
-  padding: 5px 8px;
-  width: 180px;
-  min-height: 110px;
-  display: flex;
-  flex-direction: column;
+  gap: 2px;
   align-items: center;
-  font-size: 13px;
 }
-
-.savedItem img {
-  max-width: 100%;
-  max-height: 48px;
+.menuBar h3 {
+  margin: 0 12px;
+  font-size: 18px;
+  font-weight: bold;
+  flex: 1 1 auto;
+}
+.menuBar button,
+.controlBar button,
+.tabSidebar button {
+  cursor: pointer;
+  border: none;
+  outline: none;
+  background: #16a085;
+  color: #fff;
   border-radius: 4px;
+  padding: 2px 6px;
+  margin: 0 2px;
+  font-size: 15px;
+  transition: background 0.2s;
+}
+.menuBar button:hover,
+.controlBar button:hover,
+.tabSidebar button:hover {
+  background: #ff9800;
+}
+.menuBar .debug-info {
+  font-size: 12px;
+  margin-right: 6px;
+  opacity: 0.7;
 }
 
+.controlBar {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  background: #f8f8fa;
+  padding: 4px 10px;
+  border-radius: 0 0 8px 8px;
+  margin-bottom: 2px;
+}
+.controlBar select {
+  border-radius: 4px;
+  border: 1px solid #ccc;
+  background: #fff;
+  padding: 1px 6px;
+  font-size: 14px;
+  margin: 0 2px;
+}
+
+/* サイドバータブ */
 .tabSidebar {
   position: absolute;
   left: 0;
@@ -92,8 +149,8 @@
   align-items: center;
   gap: 5px;
   padding: 4px 0;
+  z-index: 1;
 }
-
 .tab-vertical {
   width: 36px;
   height: 36px;
@@ -109,5 +166,111 @@
 .tab-vertical.active {
   background: #ff9800;
 }
+.tab-vertical img {
+  width: 24px;
+  height: 24px;
+  border-radius: 50%;
+}
 
-/* 追加デザインやレスポンシブ等は適宜追加してください */
+/* アイテム表示部 */
+.savedItems {
+  overflow-y: auto;
+  flex: 1 1 auto;
+  background: #e5ecef;
+  padding: 8px;
+  border-radius: 0 0 8px 8px;
+  margin-top: 10px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.savedItems.column {
+  flex-direction: column;
+  flex-wrap: nowrap;
+}
+.savedItem {
+  background: #fff;
+  border: 1px solid #ccd;
+  border-radius: 6px;
+  padding: 5px 8px;
+  width: 180px;
+  min-height: 110px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  font-size: 13px;
+  margin: 2px;
+  transition: background 0.2s, transform 0.2s;
+  cursor: pointer;
+}
+.savedItem.selected {
+  background: #16a085;
+  color: #fff;
+  transform: scale(1.05);
+}
+.savedItem img {
+  max-width: 100%;
+  max-height: 48px;
+  border-radius: 4px;
+  margin-bottom: 4px;
+}
+.savedItem strong {
+  color: #104437;
+}
+.savedItem .selectItem {
+  margin-bottom: 3px;
+}
+
+/* ウィンドウリサイズハンドル */
+.resize-handle {
+  position: absolute;
+  background: #bbb;
+  border-radius: 50%;
+  width: 12px;
+  height: 12px;
+  z-index: 10;
+}
+.resize-top { top: -6px; left: 50%; transform: translateX(-50%); cursor: ns-resize; }
+.resize-bottom { bottom: -6px; left: 50%; transform: translateX(-50%); cursor: ns-resize; }
+.resize-left { left: -6px; top: 50%; transform: translateY(-50%); cursor: ew-resize; }
+.resize-right { right: -6px; top: 50%; transform: translateY(-50%); cursor: ew-resize; }
+
+/* ポップアップ類 */
+.subMenu,
+.tabMenu,
+.moveTabPopup,
+.tabMenuPopup,
+#logWindow {
+  position: absolute;
+  background: #fff;
+  border: 1px solid #104437;
+  border-radius: 8px;
+  box-shadow: 2px 6px 18px #0003;
+  z-index: 20000;
+  min-width: 180px;
+  padding: 10px;
+  color: #222;
+}
+.moveTabPopup .menuBar,
+.tabMenuPopup .menuBar,
+#logWindow .menuBar {
+  background: #104437;
+  color: #fff;
+  border-radius: 6px 6px 0 0;
+  padding: 6px 12px;
+}
+
+.tabMenuItem {
+  padding: 5px;
+  border-radius: 4px;
+  margin-bottom: 2px;
+  cursor: pointer;
+}
+.tabMenuItem:hover {
+  background: #e7f5ff;
+}
+
+@media (max-width: 800px) {
+  .window { width: 95vw; height: 80vh; left: 2vw; top: 10vh; }
+  #toolbar { left: 1vw; right: auto; }
+}
