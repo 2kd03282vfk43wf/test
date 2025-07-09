@@ -1,3 +1,4 @@
+// server.js
 const express = require('express');
 const fs = require('fs');
 const cors = require('cors');
@@ -10,9 +11,13 @@ app.use(express.json());
 app.use('/public', express.static(__dirname + '/public'));
 
 app.get('/api/get', (req, res) => {
-  if (!fs.existsSync(DATA_FILE)) return res.json([]);
+  if (!fs.existsSync(DATA_FILE)) return res.json({});
   const data = fs.readFileSync(DATA_FILE, 'utf8');
-  res.json(JSON.parse(data || '[]'));
+  try {
+    res.json(JSON.parse(data || '{}'));
+  } catch {
+    res.json({});
+  }
 });
 
 app.post('/api/set', (req, res) => {
